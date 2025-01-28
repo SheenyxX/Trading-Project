@@ -1,0 +1,178 @@
+import ccxt
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+
+def fetch_data(symbol, timeframe='1d', since=None, limit=1000):
+    exchange = ccxt.binance()
+    data = exchange.fetch_ohlcv(symbol, timeframe, since, limit)
+    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    
+    # Adjust timestamps to Bogotá time (UTC-5)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True).dt.tz_convert('America/Bogota')
+    df.set_index('timestamp', inplace=True)  # Set timestamp as index
+    
+    # Resample to daily data ending at 7 PM Bogotá time
+    df = df.resample('1D', closed='right', label='right', offset='7h').agg({
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }).dropna()
+    return df
+
+def classify_volume_dynamic(volume, thresholds):
+    """Classifies volume based on dynamic thresholds."""
+    volume = float(volume)  # Ensure volume is a float
+
+    if volume <= thresholds[0]:
+        return "Very Low", 'blue', 'Very Low interest'
+    elif thresholds[0] < volume <= thresholds[1]:
+        return "Low", 'yellow', 'Low interest'
+    elif thresholds[1] < volume <= thresholds[2]:
+        return "Moderate", 'orange', 'Moderate interest'
+    elif thresholds[2] < volume <= thresholds[3]:
+        return "High", 'green', 'High interest'
+    else:
+        return "Very High", 'red', 'Very High interest'
+
+def plot_price(df, period, ax):
+    recent_data = df.tail(period)
+    ax.plot(recent_data.index, recent_data['close'], label=f'Close Price (Last {period} Days)')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Price (USDT)')
+    ax.set_title(f'BTC/USDT Price (Last {period} Days)')
+    ax.grid(True)
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    ax.tick_params(axis='x', rotation=45)
+
+def plot_volume_bar(df, period, ax, thresholds):
+    recent_data = df.tail(period).copy()
+    recent_data['volume_usd'] = recent_data['volume'] * recent_data['close']
+    
+    # Apply volume classification function based on unified thresholds
+    recent_data[['volume_level', 'color', 'sentiment']] = recent_data['volume_usd'].apply(lambda v: classify_volume_dynamic(v, thresholds)).apply(pd.Series)
+    
+    # Volume in USD values
+    last_day_volume_usd = recent_data['volume_usd'].iloc[-1]
+    yesterday_volume_usd = recent_data['volume_usd'].iloc[-2]
+    last_day_date = recent_data.index[-1].strftime('%Y-%m-%d')
+
+    # Plot volume bars with the correct colors
+    for i, row in recent_data.iterrows():
+        ax.bar(i, row['volume_usd'], color=row['color'], alpha=0.6)
+
+    ax.axhline(recent_data['volume_usd'].mean(), color='blue', linestyle='--', label=f'Avg Volume ({period} Days)')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Volume (USD)')
+    ax.set_title(f'Volume for the Last {period} Days')
+    ax.tick_params(axis='x', rotation=45)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+    ax.grid(True)
+
+    # Calculate the percentage of time in each volume level
+    volume_level_counts = recent_data['volume_level'].value_counts(normalize=True) * 100
+
+    return format_volume(recent_data['volume_usd'].mean()), recent_data['volume_usd'].iloc[-1], recent_data['volume_usd'].iloc[-2], last_day_date, volume_level_counts
+
+# Formatting function for volume
+def format_volume(volume):
+    volume = float(volume)  # Ensure volume is a float
+    if volume >= 1_000_000_000:
+        return f'{volume / 1_000_000_000:.2f}B'
+    elif volume >= 1_000_000:
+        return f'{volume / 1_000_000:.2f}M'
+    elif volume >= 1_000:
+        return f'{volume / 1_000:.2f}K'
+    else:
+        return f'{volume:.2f}'
+
+# Create Table with Color Labels
+def create_color_table(ax):
+    color_labels = [
+        ['Very Low Volume (Blue)', 'Volume <= 10th percentile'],
+        ['Low Volume (Yellow)', '10th < Volume <= 30th percentile'],
+        ['Moderate Volume (Orange)', '30th < Volume <= 70th percentile'],
+        ['High Volume (Green)', '70th < Volume <= 90th percentile'],
+        ['Very High Volume (Red)', 'Volume > 90th percentile']
+    ]
+    
+    ax.axis('off')  # Hide the axis
+    table = ax.table(cellText=color_labels, colLabels=['Volume Level', 'Volume Range'], loc='center', cellLoc='center', colColours=['#f0f0f0'] * 2)
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.auto_set_column_width([0, 1])
+
+# Example Usage
+symbol = 'BTC/USDT'
+timeframe = '1d'
+data = fetch_data(symbol, timeframe)
+
+if data is not None:
+    # Combine 90 and 30 days data to get unified thresholds
+    combined_data = pd.concat([data.tail(90)['volume'] * data.tail(90)['close'], data.tail(30)['volume'] * data.tail(30)['close']])
+    combined_thresholds = np.percentile(combined_data, [10, 30, 70, 90])
+    
+    fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(12, 8))
+
+    plot_price(data, 90, axes[0, 0])
+    plot_price(data, 30, axes[0, 1])
+
+    avg_vol_30, last_vol_30, yesterday_vol_30, last_vol_date_30, vol_counts_30 = plot_volume_bar(data, 30, axes[1, 1], combined_thresholds)
+    avg_vol_90, last_vol_90, yesterday_vol_90, last_vol_date_90, vol_counts_90 = plot_volume_bar(data, 90, axes[1, 0], combined_thresholds)
+
+    # Classification check output
+    print(f"Classifying Today's Volume: {last_vol_30} with thresholds: {combined_thresholds}")
+    print(f"Classifying Yesterday's Volume: {yesterday_vol_30} with thresholds: {combined_thresholds}")
+
+    # Table with volume metrics and sentiments
+    fig_table = plt.figure(figsize=(10, 2))
+    table_data = [
+        ['Metric', 'Value', 'Sentiment'],
+        ['Date', f'{last_vol_date_30}', ''],
+        ['30 Days Avg Volume', avg_vol_30, ''],
+        ['90 Days Avg Volume', avg_vol_90, ''],
+        ['Today\'s Volume', format_volume(last_vol_30), classify_volume_dynamic(last_vol_30, combined_thresholds)[2]],
+        ['Yesterday\'s Volume', format_volume(yesterday_vol_30), classify_volume_dynamic(yesterday_vol_30, combined_thresholds)[2]]
+    ]
+
+    ax_table = fig_table.add_subplot(111)
+    ax_table.axis('off')
+    table = ax_table.table(cellText=table_data, colLabels=None, loc='center', cellLoc='center')
+    fig.tight_layout()
+    fig_table.tight_layout()
+
+    # Create the Color Table
+    fig_color_table = plt.figure(figsize=(6, 2))
+    ax_color_table = fig_color_table.add_subplot(111)
+    create_color_table(ax_color_table)
+
+    # Percentage of time in each volume level table
+
+def plot_volume_donut_chart(volume_counts, ax, title):
+    labels = [f'{label} ({size:.2f}%)' for label, size in zip(volume_counts.index, volume_counts.values)]
+    sizes = volume_counts.values
+    colors = ['blue', 'yellow', 'orange', 'green', 'red']
+    
+    ax.pie(sizes, labels=labels, colors=colors, startangle=90, counterclock=False,
+           wedgeprops=dict(width=0.3, edgecolor='w'))
+    ax.set_title(title)
+    center_circle = plt.Circle((0,0), 0.70, fc='white')
+    fig = plt.gcf()
+    fig.gca().add_artist(center_circle)
+    ax.axis('equal')  # Equal aspect ratio ensures the pie is drawn as a circle.
+
+# Create donut charts for both 90 days and 30 days
+fig_percentage = plt.figure(figsize=(10, 5))  # Adjusted size to fit both charts
+ax_percentage_90 = fig_percentage.add_subplot(121)  # First chart on the left
+plot_volume_donut_chart(vol_counts_90, ax_percentage_90, 'Volume Level Distribution (Last 90 Days)')
+
+ax_percentage_30 = fig_percentage.add_subplot(122)  # Second chart on the right
+plot_volume_donut_chart(vol_counts_30, ax_percentage_30, 'Volume Level Distribution (Last 30 Days)')
+
+fig_percentage.tight_layout()  # Adjust layout to ensure no overlap
+plt.show()
