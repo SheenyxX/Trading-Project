@@ -1,0 +1,15 @@
+{
+    "LOOKBACK_DAYS": 1300,
+    "TIMEZONE": "UTC",
+    "DATA_DIR": "C:/path/to/data",
+    "LOG_DIR": "C:/path/to/logs",
+    "TradingParams": {
+        "MIN_TOTAL_SCORE": 4,
+        "MIN_VOLUME_PERCENTILE": 30.0,
+        "MIN_VOLATILITY_PERCENTILE": 30.0,
+        "BASE_RISK_PER_TRADE": 0.03,
+        "ATR_MULTIPLIER_SL": 1.0,
+        "ADX_TREND_THRESHOLD": 30,
+        "BB_PERIOD": 25
+    }
+}
