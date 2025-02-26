@@ -1,0 +1,367 @@
+```python
+
+# ===========================================
+# Trading Strategy Logic Explanation
+# ===========================================
+# This script implements a cryptocurrency trading strategy using Binance API data.
+# It includes market data retrieval, technical indicators, signal generation, 
+# and execution logic. The goal is to automate trading decisions based on 
+# market conditions and predefined strategy parameters.
+# ===========================================
+    import ccxt
+import pandas as pd
+import numpy as np
+import logging
+import json
+import os
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from scipy.stats import percentileofscore
+from matplotlib.patches import Rectangle, Patch
+
+# ================== SETUP ==================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+CONFIG_PATH = r"C:\Users\drewr\OneDrive\Escritorio\Google Cloud Training\trading_strategy\config.json"
+HISTORICAL_DATA_PATH = r"C:\Users\drewr\OneDrive\Escritorio\Google Cloud Training\trading_strategy\historical_market_conclusion.csv"
+
+try:
+    with open(CONFIG_PATH, 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    logging.error(f"config.json file not found at {CONFIG_PATH}. Please check the path.")
+    exit(1)
+
+LOOKBACK_DAYS = config.get("LOOKBACK_DAYS", 180)
+MACD_PARAMS = config.get("MACD_PARAMS", (12, 26, 9))
+TIMEZONE = 'UTC'
+
+# ================== DATA FETCHER ==================
+class DataFetcher:
+    def __init__(self, symbol: str, timeframe: str = '1d'):
+        self.symbol = symbol
+        self.timeframe = timeframe
+
+    def fetch_data(self) -> pd.DataFrame:
+        """Fetch 4 years of OHLCV data including today's price."""
+        exchange = ccxt.binance()
+        try:
+            logging.info(f"Fetching 4 years of data for {self.symbol}...")
+            
+            # Calculate start date for 4 years ago
+            since = exchange.parse8601((datetime.utcnow() - timedelta(days=365 * 4)).strftime('%Y-%m-%dT%H:%M:%SZ'))
+            
+            # Fetch all candles
+            data = []
+            while True:
+                candles = exchange.fetch_ohlcv(self.symbol, self.timeframe, since=since, limit=1000)
+                if not candles:
+                    break
+                data.extend(candles)
+                since = candles[-1][0] + 1  # Next start time
+                if len(candles) < 1000:
+                    break
+            
+            df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+            df.set_index('timestamp', inplace=True)
+            
+            logging.info(f"Data fetched successfully. Latest date: {df.index[-1]}")
+            return df
+            
+        except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+            logging.error(f"Error fetching data: {e}")
+            return None
+
+    def _add_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add technical indicators to DataFrame."""
+        # Volume in USD
+        df['volume_usd'] = df['volume'] * df['close']
+        
+        # True Range and ATR
+        df['prev_close'] = df['close'].shift(1)
+        df['TR'] = np.maximum(df['high'] - df['low'], 
+                          np.maximum(abs(df['high'] - df['prev_close']), 
+                          abs(df['low'] - df['prev_close'])))
+        df['ATR'] = df['TR'].rolling(window=14).mean()
+        
+        # Volume/Volatility Percentiles
+        df['volume_pct'] = df['volume_usd'].rolling(30).apply(lambda x: percentileofscore(x, x.iloc[-1]))
+        df['atr_pct'] = df['ATR'].rolling(30).apply(lambda x: percentileofscore(x, x.iloc[-1]))
+
+        # MACD
+        ema_fast = df['close'].ewm(span=MACD_PARAMS[0], adjust=False).mean()
+        ema_slow = df['close'].ewm(span=MACD_PARAMS[1], adjust=False).mean()
+        df['macd'] = ema_fast - ema_slow
+        df['signal'] = df['macd'].ewm(span=MACD_PARAMS[2], adjust=False).mean()
+        df['histogram'] = df['macd'] - df['signal']
+        
+        return df
+
+# ================== MARKET ANALYZER ==================
+class MarketAnalyzer:
+    @staticmethod
+    def determine_market_status(df: pd.DataFrame) -> str:
+        """Determine current market status."""
+        latest = df.iloc[-1]
+        macd_trend = "bullish" if latest['macd'] > latest['signal'] else "bearish"
+        volume_status = "high" if latest['volume_pct'] > 70 else "low"
+        volatility_status = "high" if latest['atr_pct'] > 70 else "low"
+
+        if macd_trend == "bullish" and volume_status == "high" and volatility_status == "high":
+            return "Strong Uptrend"
+        elif macd_trend == "bearish" and volume_status == "high" and volatility_status == "high":
+            return "Strong Downtrend"
+        elif volume_status == "low" and volatility_status == "low":
+            return "Sideways/Consolidation"
+        else:
+            return "Caution/Uncertain"
+
+    @staticmethod
+    def get_market_metrics(df: pd.DataFrame) -> dict:
+        """Get clean metrics for a specific day."""
+        latest = df.iloc[-1]
+        return {
+            "timestamp": latest.name.strftime('%Y-%m-%d'),
+            "market_status": MarketAnalyzer.determine_market_status(df),
+            "macd_trend": "bullish" if latest['macd'] > latest['signal'] else "bearish",
+            "volume_status": "high" if latest['volume_pct'] > 70 else "low",
+            "volatility_status": "high" if latest['atr_pct'] > 70 else "low",
+            "trade_decision": "Trade Now" if latest['volume_pct'] > 70 and latest['atr_pct'] > 70 else "Stay Cautious" if (latest['volume_pct'] > 70 or latest['atr_pct'] > 70) else "Avoid Trading"
+        }
+
+    @staticmethod
+    def backtest_historical_data(df: pd.DataFrame) -> pd.DataFrame:
+        """Backtest historical data and generate metrics for each day."""
+        results = []
+        for i in range(30, len(df)):  # Start from day 30 to allow rolling calculations
+            daily_df = df.iloc[:i+1]  # Slice data up to the current day
+            metrics = MarketAnalyzer.get_market_metrics(daily_df)
+            results.append(metrics)
+        
+        return pd.DataFrame(results)
+
+# ================== VISUALIZER ==================
+class Visualizer:
+    @staticmethod
+    def classify_volume_color(volume_pct):
+        """Classify volume into color categories based on percentiles."""
+        if volume_pct <= 10:
+            return 'darkblue'    # Very Low
+        elif 10 < volume_pct <= 30:
+            return 'lightblue'   # Low
+        elif 30 < volume_pct <= 70:
+            return 'yellow'      # Moderate
+        elif 70 < volume_pct <= 90:
+            return 'green'      # High
+        else:
+            return 'red'         # Very High
+
+    @staticmethod
+    def plot_price(df, period: int, ax: plt.Axes):
+        """Plot price data."""
+        recent_data = df.tail(period)
+        ax.plot(recent_data.index, recent_data['close'], label=f'Close Price (Last {period} Days)')
+        ax.set_xlabel('')
+        ax.set_ylabel('Price (USDT)')
+        ax.set_title(f'BTC/USDT Price (Last {period} Days)')
+        ax.grid(True)
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        ax.tick_params(axis='x', rotation=45)
+        ax.legend()
+
+    @staticmethod
+    def plot_macd(df: pd.DataFrame, period: int, ax: plt.Axes):
+        """Plot MACD data."""
+        recent_data = df.tail(period)
+        ax.plot(recent_data.index, recent_data['macd'], label='MACD', color='blue')
+        ax.plot(recent_data.index, recent_data['signal'], label='Signal Line', color='orange')
+        colors = np.where(recent_data['histogram'] >= 0, 'green', 'red')
+        ax.bar(recent_data.index, recent_data['histogram'], color=colors, alpha=0.5, label='Histogram')
+        ax.set_title(f'MACD (Last {period} Days)')
+        ax.legend()
+        ax.grid(True)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        ax.tick_params(axis='x', rotation=45)
+
+    @staticmethod
+    def plot_volume_bar(df: pd.DataFrame, period: int, ax: plt.Axes):
+        """Plot volume data with dynamic colors."""
+        recent_data = df.tail(period)
+        colors = recent_data['volume_pct'].apply(Visualizer.classify_volume_color)
+        ax.bar(recent_data.index, recent_data['volume_usd'], color=colors, alpha=0.6)
+        ax.axhline(recent_data['volume_usd'].mean(), color='purple', linestyle='--', 
+                  label=f'Avg Volume ({period} Days)')
+        ax.set_title(f'Volume (Last {period} Days)')
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        ax.grid(True)
+
+    @staticmethod
+    def plot_volume_volatility_scatter(df: pd.DataFrame, ax: plt.Axes):
+        """Plot volume vs volatility scatterplot with yesterday's data."""
+        clean_df = df[['volume_pct', 'atr_pct']].copy().dropna()
+        if len(clean_df) < 10:
+            ax.text(0.5, 0.5, 'Insufficient Data', ha='center', va='center', fontsize=12)
+            ax.set_title("Volume vs Volatility Scatterplot")
+            return
+        
+        # Background zones
+        ax.add_patch(Rectangle((70, 70), 30, 30, facecolor='green', alpha=0.2, 
+                    label='Trade Now: High Volume & Volatility'))
+        ax.add_patch(Rectangle((0, 70), 70, 30, facecolor='orange', alpha=0.2, 
+                    label='Stay Cautious: Mixed Signals'))
+        ax.add_patch(Rectangle((70, 0), 30, 70, facecolor='orange', alpha=0.2))
+        ax.add_patch(Rectangle((0, 0), 70, 70, facecolor='red', alpha=0.2, 
+                    label='Avoid Trading: Low Activity'))
+
+        # Historical data
+        ax.scatter(clean_df['volume_pct'], clean_df['atr_pct'], c='gray', 
+                  alpha=0.3, s=30, label='Historical Data')
+
+        # Today's and yesterday's data points
+        today = clean_df.iloc[-1]
+        yesterday = clean_df.iloc[-2] if len(clean_df) > 1 else None
+        
+        ax.scatter(today['volume_pct'], today['atr_pct'], c='white', s=200,
+                  edgecolor='black', linewidth=2, label="Today's Position", zorder=10)
+        
+        if yesterday is not None:
+            ax.scatter(yesterday['volume_pct'], yesterday['atr_pct'], c='black', s=100,
+                      edgecolor='white', linewidth=1, label="Yesterday's Position", zorder=9)
+
+        ax.set_title("Market Activity Zones: Volume vs Volatility")
+        ax.set_xlabel("Volume Percentile (0-100%)")
+        ax.set_ylabel("Volatility (ATR) Percentile (0-100%)")
+        ax.set_xlim(0, 100)
+        ax.set_ylim(0, 100)
+        ax.grid(True, linestyle='--', alpha=0.7)
+        
+        # Custom legend
+        legend_elements = [
+            Patch(facecolor='green', alpha=0.2, label='Trade Now'),
+            Patch(facecolor='orange', alpha=0.2, label='Stay Cautious'),
+            Patch(facecolor='red', alpha=0.2, label='Avoid Trading'),
+            plt.Line2D([0], [0], marker='o', color='w', label='Today',
+                      markerfacecolor='white', markersize=10, markeredgecolor='black'),
+            plt.Line2D([0], [0], marker='o', color='w', label='Yesterday',
+                      markerfacecolor='black', markersize=8, markeredgecolor='white')
+        ]
+        ax.legend(handles=legend_elements, loc='upper left')
+
+# ================== MAIN FUNCTION ==================
+def main():
+    symbol = 'BTC/USDT'
+    timeframe = '1d'
+
+    fetcher = DataFetcher(symbol, timeframe)
+    analyzer = MarketAnalyzer()
+    visualizer = Visualizer()
+
+    # Fetch and process data
+    df = fetcher.fetch_data()
+    if df is not None:
+        df = fetcher._add_technical_indicators(df)
+        
+        # Analyze today's status
+        today_metrics = analyzer.get_market_metrics(df)
+        print("\n=== Today's Market Status ===")
+        for key, value in today_metrics.items():
+            print(f"{key}: {value}")
+        
+        # Backtest historical data
+        historical_results = analyzer.backtest_historical_data(df)
+        
+        # Save historical results to CSV
+        historical_results.to_csv(HISTORICAL_DATA_PATH, index=False)
+        logging.info(f"Historical metrics saved to {HISTORICAL_DATA_PATH}.")
+
+        # Visualize data
+        fig = plt.figure(figsize=(20, 25))  # Adjusted figure height
+        gs = fig.add_gridspec(7, 2, height_ratios=[1.2, 1.2, 1, 1, 1.5, 1, 0.5])
+        
+        # Price charts
+        ax_price90 = fig.add_subplot(gs[0, 0])
+        ax_price30 = fig.add_subplot(gs[0, 1])
+        visualizer.plot_price(df, 90, ax_price90)
+        visualizer.plot_price(df, 30, ax_price30)
+
+        # MACD charts
+        ax_macd90 = fig.add_subplot(gs[1, 0])
+        ax_macd30 = fig.add_subplot(gs[1, 1])
+        visualizer.plot_macd(df, 90, ax_macd90)
+        visualizer.plot_macd(df, 30, ax_macd30)
+
+        # Volume charts
+        ax_vol90 = fig.add_subplot(gs[2, 0])
+        ax_vol30 = fig.add_subplot(gs[2, 1])
+        visualizer.plot_volume_bar(df, 90, ax_vol90)
+        visualizer.plot_volume_bar(df, 30, ax_vol30)
+
+        # Scatter plot
+        ax_scatter = fig.add_subplot(gs[3:5, :])
+        visualizer.plot_volume_volatility_scatter(df, ax_scatter)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+        plt.suptitle(f'Cryptocurrency Trading Analysis: {symbol}', fontsize=16)
+        plt.savefig('crypto_trading_analysis.png', dpi=300, bbox_inches='tight')
+        logging.info("Analysis complete. Dashboard saved as crypto_trading_analysis.png")
+
+if __name__ == "__main__":
+    main()
+
+
+# ===========================================
+# Trading Strategy Logic Explanation
+# ===========================================
+# This script implements a cryptocurrency trading strategy using Binance API data.
+# It includes market data retrieval, technical indicators, signal generation, 
+# and execution logic. The goal is to automate trading decisions based on 
+# market conditions and predefined strategy parameters.
+# ===========================================
+    import pandas as pd
+
+# Load the CSV file
+file_path = r"C:\Users\drewr\OneDrive\Escritorio\Google Cloud Training\trading_strategy\historical_market_conclusion.csv"
+df = pd.read_csv(file_path)
+
+# Display cleaned data
+df.head(5)
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Load the CSV file
+file_path = r"C:\Users\drewr\OneDrive\Escritorio\Google Cloud Training\trading_strategy\historical_market_conclusion.csv"
+df = pd.read_csv(file_path)
+
+# Count the occurrences of each category in the 'trade_decision' column
+trade_decision_counts = df['trade_decision'].value_counts()
+
+# Calculate the percentage of each category
+trade_decision_percents = (trade_decision_counts / trade_decision_counts.sum()) * 100
+
+# Convert the counts and percentages to a DataFrame
+trade_decision_counts_df = trade_decision_counts.reset_index()
+trade_decision_counts_df.columns = ['Trade Decision', 'Count']
+trade_decision_counts_df['Percentage'] = trade_decision_percents.values
+
+# Create a horizontal bar chart
+plt.figure(figsize=(12, 2))
+bars = plt.barh(trade_decision_counts_df['Trade Decision'], trade_decision_counts_df['Count'], color='skyblue')
+plt.xlabel('Count')
+plt.ylabel('Trade Decision')
+plt.title('Trade Decision Counts')
+
+# Add the counts and percentages inside each bar
+for i, bar in enumerate(bars):
+    xval = bar.get_width()
+    yval = bar.get_y() + bar.get_height() / 2
+    plt.text(xval - (xval * 0.05), yval, f'{int(xval)} ({trade_decision_counts_df.loc[i, "Percentage"]:.2f}%)', ha='center', va='center', color='black', fontweight='bold')
+
+plt.show()
+
+
+```
