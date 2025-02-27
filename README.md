@@ -1,4 +1,4 @@
-# BTC/USDT Trading Bot
+# BTC/USDT Trading Strategy
 
 ## Overview
 This project is a Python-based trading bot designed to automate cryptocurrency trading strategies. It fetches market data, applies technical indicators, generates buy/sell signals, and backtests strategies to evaluate performance. The bot incorporates robust risk management features and exports detailed trade metrics for analysis.
